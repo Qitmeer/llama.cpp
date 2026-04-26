@@ -1,7 +1,9 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include "build-info.h"
 #include "common.h"
+#include "fit.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -359,6 +361,11 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
 }
 
 void common_init() {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     llama_log_set(common_log_default_callback, NULL);
 
 #ifdef NDEBUG
@@ -367,7 +374,7 @@ void common_init() {
     const char * build_type = " (debug)";
 #endif
 
-    LOG_INF("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
+    LOG_DBG("build: %d (%s) with %s for %s%s\n", llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -450,34 +457,6 @@ void string_replace_all(std::string & s, const std::string & search, const std::
     }
     builder.append(s, last_pos, std::string::npos);
     s = std::move(builder);
-}
-
-bool string_ends_with(const std::string_view & str, const std::string_view & suffix) {
-    return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
-}
-
-bool string_remove_suffix(std::string & str, const std::string_view & suffix) {
-    bool has_suffix = string_ends_with(str, suffix);
-    if (has_suffix) {
-        str = str.substr(0, str.size() - suffix.size());
-    }
-    return has_suffix;
-}
-
-size_t string_find_partial_stop(const std::string_view & str, const std::string_view & stop) {
-    if (!str.empty() && !stop.empty()) {
-        const char text_last_char = str.back();
-        for (int64_t char_index = stop.size() - 1; char_index >= 0; char_index--) {
-            if (stop[char_index] == text_last_char) {
-                const auto current_partial = stop.substr(0, char_index + 1);
-                if (string_ends_with(str, current_partial)) {
-                    return str.size() - char_index - 1;
-                }
-            }
-        }
-    }
-
-    return std::string::npos;
 }
 
 std::string regex_escape(const std::string & s) {
@@ -684,6 +663,97 @@ bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_over
     return true;
 }
 
+static inline bool glob_class_match(const char c, const char * pattern, const char * class_end) {
+    const char * class_start = pattern;
+    bool negated = false;
+
+    if (*class_start == '!') {
+        negated = true;
+        class_start++;
+    }
+
+    // If first character after negation is ']' or '-', treat it as literal
+    if (*class_start == ']' || *class_start == '-') {
+        if (class_start < class_end && *class_start == c) {
+            return !negated;
+        }
+        class_start++;
+    }
+
+    bool matched = false;
+
+    while (class_start < class_end) {
+        if (class_start + 2 < class_end && class_start[1] == '-' && class_start[2] != ']') {
+            char start_char = *class_start;
+            char end_char = class_start[2];
+            if (c >= start_char && c <= end_char) {
+                matched = true;
+                break;
+            }
+            class_start += 3;
+        } else {
+            if (*class_start == c) {
+                matched = true;
+                break;
+            }
+            class_start++;
+        }
+    }
+
+    return negated ? !matched : matched;
+}
+
+// simple glob: * matches non-/ chars, ** matches anything including /, [] matches character class
+static inline bool glob_match(const char * pattern, const char * str) {
+    if (*pattern == '\0') {
+        return *str == '\0';
+    }
+    if (pattern[0] == '*' && pattern[1] == '*') {
+        const char * p = pattern + 2;
+        if (glob_match(p, str)) return true;
+        if (*str != '\0') return glob_match(pattern, str + 1);
+        return false;
+    }
+    if (*pattern == '*') {
+        const char * p = pattern + 1;
+        for (; *str != '\0' && *str != '/'; str++) {
+            if (glob_match(p, str)) return true;
+        }
+        return glob_match(p, str);
+    }
+    if (*pattern == '?' && *str != '\0' && *str != '/') {
+        return glob_match(pattern + 1, str + 1);
+    }
+    if (*pattern == '[') {
+        const char * class_end = pattern + 1;
+        // If first character after '[' is ']' or '-', treat it as literal
+        if (*class_end == ']' || *class_end == '-') {
+            class_end++;
+        }
+        while (*class_end != '\0' && *class_end != ']') {
+            class_end++;
+        }
+        if (*class_end == ']') {
+            if (*str == '\0') return false;
+            bool matched = glob_class_match(*str, pattern + 1, class_end);
+            return matched && glob_match(class_end + 1, str + 1);
+        } else {
+            if (*str == '[') {
+                return glob_match(pattern + 1, str + 1);
+            }
+            return false;
+        }
+    }
+    if (*pattern == *str) {
+        return glob_match(pattern + 1, str + 1);
+    }
+    return false;
+}
+
+bool glob_match(const std::string & pattern, const std::string & str) {
+    return glob_match(pattern.c_str(), str.c_str());
+}
+
 //
 // Filesystem utils
 //
@@ -704,7 +774,7 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
 
     size_t offset = 0;
     while (offset < filename.size()) {
-        utf8_parse_result result = parse_utf8_codepoint(filename, offset);
+        utf8_parse_result result = common_parse_utf8_codepoint(filename, offset);
 
         if (result.status != utf8_parse_result::SUCCESS) {
             return false;
@@ -879,7 +949,8 @@ std::string fs_get_cache_directory() {
     if (getenv("LLAMA_CACHE")) {
         cache_directory = std::getenv("LLAMA_CACHE");
     } else {
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || defined(__OpenBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
+        defined(__OpenBSD__) || defined(__NetBSD__)
         if (std::getenv("XDG_CACHE_HOME")) {
             cache_directory = std::getenv("XDG_CACHE_HOME");
         } else if (std::getenv("HOME")) {
@@ -1077,7 +1148,7 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
-        llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
+        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
@@ -1094,7 +1165,7 @@ common_init_result::common_init_result(common_params & params) :
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // load and optionally apply lora adapters (must be loaded before context creation)
+    // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
@@ -1179,6 +1250,9 @@ llama_context * common_init_result::context() {
 }
 
 common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
+        return nullptr;
+    }
     return pimpl->samplers[seq_id].get();
 }
 
@@ -1223,7 +1297,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
             return res;
         }
 
-        int err = llama_apply_adapter_cvec(
+        int err = llama_set_adapter_cvec(
                 lctx,
                 cvec.data.data(),
                 cvec.data.size(),
@@ -1309,7 +1383,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
 
 common_init_result::~common_init_result() = default;
 
-std::string get_model_endpoint() {
+std::string common_get_model_endpoint() {
     const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
     // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
     const char * hf_endpoint_env = getenv("HF_ENDPOINT");
@@ -1324,13 +1398,52 @@ std::string get_model_endpoint() {
     return model_endpoint;
 }
 
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
-    llama_clear_adapter_lora(ctx);
-    for (auto & la : lora) {
-        if (la.scale != 0.0f) {
-            llama_set_adapter_lora(ctx, la.ptr, la.scale);
-        }
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    auto * mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
+
+    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
+    llama_memory_clear(mem, true);
+
+    // eval 2 tokens to check if the context is compatible
+    std::vector<llama_token> tmp;
+    tmp.push_back(0);
+    tmp.push_back(0);
+
+    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        goto done;
+    }
+
+    // try to remove the last tokens
+    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        goto done;
+    }
+
+done:
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx);
+
+    return res;
+}
+
+void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
+    std::vector<llama_adapter_lora *> loras;
+    std::vector<float> scales;
+
+    for (auto & la: lora) {
+        loras.push_back(la.ptr);
+        scales.push_back(la.scale);
+    }
+
+    llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
@@ -1367,6 +1480,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
+    mparams.no_alloc                    = params.no_alloc;
 
     return mparams;
 }
@@ -1783,4 +1897,66 @@ float lr_opt::get_lr(float epoch) const {
         lr0 * std::pow(0.5f, epoch * scale_epoch);
     LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
     return r;
+}
+
+bool common_replay_last_token(struct llama_context * ctx, llama_token last_token, int32_t pos) {
+    llama_batch batch = llama_batch_get_one(&last_token, 1);
+    batch.pos = &pos;
+    if (llama_decode(ctx, batch)) {
+        LOG_ERR("%s: failed to replay last token\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+bool common_prompt_batch_decode(
+              struct llama_context * ctx,
+    const std::vector<llama_token> & tokens,
+                               int & n_past,
+                               int   n_batch,
+                  std::string_view   state_path,
+                              bool   save_state) {
+    const int n_eval = tokens.size();
+    if (n_eval == 0) {
+        return true;
+    }
+
+    if (save_state && n_eval > 1) {
+        const int n_tokens_before_last = n_eval - 1;
+
+        GGML_ASSERT(n_eval <= n_batch);
+
+        // Decode all but the last token so we can save the memory state before decoding the last token.
+        // This is done so we can restore the session state later and replay the last token.
+        // Memory implementations in recurrent/hybrid models don't support removing tokens from their
+        // memory, so we can't just remove the last token from the memory and replay the last token which
+        // is the reason for this logic.
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_tokens_before_last))) {
+            LOG_ERR("%s : failed to eval\n", __func__);
+            return false;
+        }
+        n_past += n_tokens_before_last;
+
+        llama_state_save_file(ctx, state_path.data(), tokens.data(), n_tokens_before_last);
+        LOG_INF("saved session before last token to %s, n_tokens = %d\n", state_path.data(), n_tokens_before_last);
+
+        llama_token last_token = tokens.back();
+        llama_batch batch = llama_batch_get_one(&last_token, 1);
+        int32_t pos = n_past;
+        batch.pos = &pos;
+
+        if (llama_decode(ctx, batch)) {
+            LOG_ERR("%s : failed to eval last token\n", __func__);
+            return false;
+        }
+        n_past++;
+    } else {
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_eval))) {
+            LOG_ERR("%s : failed to eval\n", __func__);
+            return false;
+        }
+        n_past += n_eval;
+    }
+
+    return true;
 }
